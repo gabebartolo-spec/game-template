@@ -1,0 +1,4 @@
+# Seconds per suite from tools/run_tests.sh (TIMINGS_FILE=...), 2026-10-20.
+# tools/plan_ci_shards.sh splits the suites across shards from these.
+shards 1
+smoke 1

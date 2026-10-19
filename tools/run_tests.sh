@@ -1,0 +1,213 @@
+#!/usr/bin/env bash
+# Runs every Godot check CI runs (.github/workflows/tests.yml), locally or in Actions:
+#   1. import the project (a script that fails to compile during import fails the run);
+#   2. every test suite in tests/, each with a time limit so a hang fails fast instead of
+#      eating the runner; a suite whose log shows a script error fails even if every
+#      check it reached passed;
+#   3. the harness self-test (tools/test_run_tests.sh), when no suites are named.
+#
+# A green suite must mean every test ran:
+#   - suites run on a fixed frame clock (--fixed-fps), so a busy machine cannot change
+#     what happens between two checks;
+#   - every suite calls its test functions through tests/functions_ran.gd and ends with
+#     "<Suite> tests: K of M functions, N checks, F failures"; a `_test_*` function that
+#     never ran or made no check is a failure by name, and a line short of functions
+#     ("functions short") or with no function count fails here. Nothing is kept by hand:
+#     no floors, and suites are found by filename (tests/run_<suite>_tests.gd), so a new
+#     suite or test counts itself and two PRs never conflict over a registry
+#     (director 2026-10-19, github-hygiene §4);
+#   - a check a suite skips on purpose prints one "SKIP: <reason>" line, and the summary
+#     says how many were skipped.
+#
+# Every run gets its own user data, settings and editor caches: APPDATA (Windows) and
+# the XDG dirs (Linux) point at a temp dir for the whole run, so two agents' runs never
+# share a save, a setting or an editor cache (CLAUDE.md "Machine rules").
+#
+#   GODOT=/path/to/godot tools/run_tests.sh          # everything
+#   SUITE_TIMEOUT=300 tools/run_tests.sh data smoke   # just some suites
+#   QUICK=1 tools/run_tests.sh data                   # the local loop: no re-import
+#   TIMINGS_FILE=tools/ci_timings.txt tools/run_tests.sh   # re-measure the CI shard plan
+#
+# Exits nonzero if anything failed.
+set -u
+cd "$(dirname "$0")/.." || exit 1
+
+GODOT="${GODOT:-godot}"
+SUITE_TIMEOUT="${SUITE_TIMEOUT:-900}"
+IMPORT_TIMEOUT="${IMPORT_TIMEOUT:-600}"
+# Where the runners live (tools/test_run_tests.sh points this at its fixtures).
+RUNNER_DIR="${RUNNER_DIR:-tests}"
+# QUICK=1 skips the project import: the local loop after one full run, when only scripts
+# changed. CI and any asset change run the import.
+QUICK="${QUICK:-0}"
+# SUITES_ONLY=1 skips the harness self-test after the suites.
+# EXTRAS_ONLY=1 runs only the self-test, no suites.
+# CI splits the work this way: shards run SUITES_ONLY, one job runs EXTRAS_ONLY.
+SUITES_ONLY="${SUITES_ONLY:-0}"
+ALL_SUITES=()
+for runner_file in tests/run_*_tests.gd; do
+	[ -e "$runner_file" ] || continue
+	name="${runner_file#tests/run_}"
+	ALL_SUITES+=("${name%_tests.gd}")
+done
+[ "$#" -gt 0 ] && SUITES=("$@") || SUITES=("${ALL_SUITES[@]}")
+# Read once and clear it: the harness self-test runs this script again, and a child
+# that inherited EXTRAS_ONLY would run no suites and pass a short one.
+extras_only="${EXTRAS_ONLY:-0}"
+unset EXTRAS_ONLY
+[ "$extras_only" = 1 ] && SUITES=()
+
+LOG_DIR="${LOG_DIR:-$(mktemp -d)}"
+mkdir -p "$LOG_DIR"
+RUN_DATA="$(mktemp -d)"
+trap 'rm -rf "$RUN_DATA"' EXIT
+native_path() {  # Godot on Windows needs a Windows path in APPDATA
+	if command -v cygpath > /dev/null 2>&1; then cygpath -w "$1"; else echo "$1"; fi
+}
+APPDATA="$(native_path "$RUN_DATA")"
+export APPDATA
+export XDG_DATA_HOME="$RUN_DATA/data" XDG_CONFIG_HOME="$RUN_DATA/config" XDG_CACHE_HOME="$RUN_DATA/cache"
+
+failed=0
+summary=()
+in_ci=0
+[ -n "${GITHUB_ACTIONS:-}" ] && in_ci=1
+
+note_error() {  # message
+	if [ "$in_ci" = 1 ]; then echo "::error::$1"; else echo "ERROR: $1"; fi
+}
+
+echo "== Godot: $("$GODOT" --headless --version 2> /dev/null | tail -1)"
+if [ "$QUICK" = 1 ]; then
+	echo "== Quick: skipping the import (run once without QUICK=1 after asset changes)"
+else
+echo "== Importing the project"
+timeout "$IMPORT_TIMEOUT" "$GODOT" --headless --path . --editor --import > "$LOG_DIR/import.log" 2>&1
+import_code=$?
+if [ "$import_code" != 0 ] || grep -qE "SCRIPT ERROR|Parse Error|Compile Error" "$LOG_DIR/import.log"; then
+	grep -E -A3 "SCRIPT ERROR|Parse Error|Compile Error" "$LOG_DIR/import.log" || tail -20 "$LOG_DIR/import.log"
+	note_error "the project failed to import (exit $import_code)"
+	echo "Logs: $LOG_DIR"
+	exit 1
+fi
+summary+=("| import | pass | |")
+fi
+timings=()
+
+for suite in ${SUITES[@]+"${SUITES[@]}"}; do
+	runner="$RUNNER_DIR/run_${suite}_tests.gd"
+	log="$LOG_DIR/$suite.log"
+	start=$(date +%s)
+	timeout "$SUITE_TIMEOUT" "$GODOT" --headless --fixed-fps 60 --path . --script "$runner" > "$log" 2>&1
+	code=$?
+	secs=$(($(date +%s) - start))
+	result=$(grep -E "[0-9]+ checks, [0-9]+ failures" "$log" | tail -1)
+	if [ "$code" = 124 ]; then
+		status="FAIL"
+		detail="timed out after ${SUITE_TIMEOUT}s"
+	elif [ "$code" != 0 ] || [ -z "$result" ]; then
+		status="FAIL"
+		detail="${result:-no result (exit $code)}"
+	elif grep -qE "SCRIPT ERROR|Parse Error|Compile Error" "$log"; then
+		# A runtime error aborts the function it hit, so the checks after it never
+		# run and the suite can still report 0 failures.
+		status="FAIL"
+		detail="$result, but a script error stopped part of the suite"
+	else
+		status="pass"
+		detail="$result"
+	fi
+	# Every test function must have run: "K of M functions" with K = M.
+	ran=$(echo "$result" | grep -oE "[0-9]+ of [0-9]+ functions" | head -1)
+	ran_k=$(echo "$ran" | awk '{print $1}')
+	ran_m=$(echo "$ran" | awk '{print $3}')
+	skipped=$(grep -c "^SKIP:" "$log")
+	short=""
+	if [ -n "$result" ] && [ -z "$ran" ]; then
+		short="the line has no function count (call tests through _t, tests/functions_ran.gd)"
+	elif [ -n "$ran" ] && [ "$ran_k" -lt "$ran_m" ]; then
+		short="functions short: $((ran_m - ran_k)) never ran (named in the log)"
+	elif [ -n "$ran" ] && [ "$ran_m" -eq 0 ]; then
+		short="the suite has no _test_ functions"
+	fi
+	if [ -n "$short" ] && [ "$code" != 124 ]; then
+		status="FAIL"
+		detail="$detail; $short"
+	fi
+	timings+=("$suite $secs")
+	if [ "$skipped" -gt 0 ]; then
+		detail="$detail ($skipped skipped on purpose)"
+	fi
+	printf '%-5s %-11s %4ss  %s\n' "$status" "$suite" "$secs" "$detail"
+	if [ "$status" = FAIL ]; then
+		failed=1
+		note_error "suite '$suite' failed: $detail"
+		[ "$in_ci" = 1 ] && echo "::group::$suite log (failures and errors)"
+		grep -E -A4 "^FAIL:|SCRIPT ERROR|^ERROR" "$log" | head -60
+		[ "$in_ci" = 1 ] && echo "::endgroup::"
+		# Failed checks and parse errors become job annotations, so a red run can be
+		# read without downloading the logs.
+		if [ "$in_ci" = 1 ]; then
+			grep -E "SCRIPT ERROR|Parse Error|Compile Error" "$log" | head -20 | while IFS= read -r l; do
+				printf '::error::%s-log::%s\n' "$suite" "$l"
+			done
+			grep -E "^FAIL:" "$log" | head -30 | while IFS= read -r l; do
+				printf '::error::%s-check::%s\n' "$suite" "${l#FAIL: }"
+			done
+		fi
+	fi
+	summary+=("| $suite | $status | $detail (${secs}s) |")
+done
+
+# The harness checks itself: a test function that never ran or made no check must fail,
+# and an untyped declaration must not compile.
+if [ "$SUITES_ONLY" != 1 ] && [ "$#" -eq 0 ]; then
+	echo "== Harness self-test"
+	if GODOT="$GODOT" tools/test_run_tests.sh > "$LOG_DIR/harness_selftest.log" 2>&1; then
+		summary+=("| harness_selftest | pass | |")
+	else
+		selftest_log="$LOG_DIR/harness_selftest.log"
+		tail -15 "$selftest_log"
+		# Name what failed. The self-test prints one "FAIL: <what>" line per broken
+		# expectation; when its first step ("the smoke suite should pass") failed, the
+		# smoke suite itself is red and the harness is not at fault, so say so and quote
+		# the suite's own failure line.
+		what=$(grep -E "^FAIL:" "$selftest_log" | head -1 | sed 's/^FAIL: //')
+		suite_line=$(grep -oE "suite '[^']+' failed: [^(]*" "$selftest_log" | head -1)
+		if [ -z "$what" ]; then
+			detail="no FAIL line in the self-test log, see $selftest_log"
+		elif [ "$what" = "the smoke suite should pass" ] && [ -n "$suite_line" ]; then
+			detail="the smoke suite is red, not the harness: $suite_line"
+		else
+			detail="$what${suite_line:+ ($suite_line)}"
+		fi
+		note_error "harness self-test (tools/test_run_tests.sh): $detail"
+		failed=1
+		summary+=("| harness_selftest | FAIL | $detail |")
+	fi
+fi
+
+# TIMINGS_FILE: write each suite's seconds for tools/plan_ci_shards.sh, keeping its
+# "shards <n>" line. Re-measure at least weekly and after adding a slow suite.
+if [ -n "${TIMINGS_FILE:-}" ] && [ "${#timings[@]}" -gt 0 ]; then
+	shards_line=$(grep -E "^shards[[:space:]]" "$TIMINGS_FILE" 2> /dev/null || echo "shards 1")
+	{
+		echo "# Seconds per suite from tools/run_tests.sh (TIMINGS_FILE=...), $(date +%F)."
+		echo "# tools/plan_ci_shards.sh splits the suites across shards from these."
+		echo "$shards_line"
+		printf '%s
+' "${timings[@]}"
+	} > "$TIMINGS_FILE"
+fi
+
+if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+	{
+		echo "### Test results"
+		echo "| Check | Result | Detail |"
+		echo "|---|---|---|"
+		printf '%s\n' "${summary[@]}"
+	} >> "$GITHUB_STEP_SUMMARY"
+fi
+echo "Logs: $LOG_DIR"
+[ "$failed" = 0 ] && echo "All checks passed." || echo "Some checks FAILED."
+exit "$failed"
